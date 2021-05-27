@@ -1,17 +1,18 @@
+// cuda by examples
 #include "../common/book.h"
 #include <curand_kernel.h>
 #include<stdio.h>
 #include<stdlib.h>
 
 #define EPISODE 10000
-#define BURNIN  9991
+#define BURNIN  9990
 #define DIM     2
 // my laptop 1050 Multiprocessor count:  5
 #define BLOCKS 5
 // my laptop 1050:Max threads per block:  1024
 #define THREADS 1024
-#define STEPS 5
-#define DT0 0.000001
+#define STEPS 10
+#define DT0 0.000000001
 #define SWITCH true
 #define decaydt 0.1
 #define decayenergy 0.1
@@ -20,7 +21,6 @@
 const float rho = 0.9999999;
 float qinit[DIM]={0.1,0.1};
 
-//const float rho = 0.9;
 __device__ float U(float* q)
 {
   float x=q[0];
@@ -36,8 +36,6 @@ __device__ void dU(float*q, float*dudq)
 }
 __device__ void ddU(float* q,float* h)
 {
-  //float x=q[0];
-  //float y=q[1];
   h[0] = 1./(1.-rho*rho);
   h[1] = -rho/(1.-rho*rho);
   h[2] = -rho/(1.-rho*rho);

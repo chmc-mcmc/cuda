@@ -1,5 +1,5 @@
  #include <time.h>
-#define CHAINS  (BLOCKS*THREADS)     
+#define CHAINS  (BLOCKS*THREADS)
 
 #define AT(aa,ii,jj) (*(aa+(ii)*(DIM+1)+jj))
 __device__ int solve(float *a, float *x)
@@ -47,6 +47,7 @@ struct SHARE{
   float p[CHAINS][DIM];
   float x[CHAINS][DIM];
   float q0[CHAINS][DIM];
+  float q1[CHAINS][DIM];
   float UE[CHAINS][STEPS+1];
    float dt;
    float scale;
@@ -63,19 +64,19 @@ struct SHARE{
 __global__ void sample(float *QS, float *qinit, SHARE *shr, long seed)
 {
   int id = threadIdx.x + blockIdx.x * blockDim.x;
-  curand_init(seed, id, 0, &shr->state[id]);
+  curand_init(seed, id, 0, shr->state + id);
 
   //1. init qAll
   for(int i = 0; i < DIM; i++){
     if(USE_INIT){
       shr->q[id][i] = qinit[i];
     }else{
-      shr->q[id][i] = curand_normal(&shr->state[id]);
+      shr->q[id][i] = curand_normal(shr->state + id);
     }
     
   }
   //2. Utotal
-  shr->cache[id] = U(&(shr->q[id][0]));
+  shr->cache[id] = U(shr->q[id]);
   __syncthreads();
   if (id == 0){
     float Utotal = 0;
@@ -95,22 +96,22 @@ __global__ void sample(float *QS, float *qinit, SHARE *shr, long seed)
     __syncthreads();
     //4.
     for(int i = 0; i < DIM; i++){
-      shr->p[id][i] = curand_normal(&shr->state[id]);
+      shr->p[id][i] = curand_normal(shr->state + id);
     }
 
     //5.
     if(shr->vanilla){
-      shr->cache[id] = dot(&(shr->p[id][0]), &(shr->p[id][0]), DIM)/2.;
+      shr->cache[id] = dot(shr->p[id], shr->p[id], DIM)/2.;
     }else{
-      ddU(&(shr->q[id][0]), &shr->h[id][0][0]);
+      ddU(shr->q[id], shr->h[id][0]);
       for(int i = 0; i < DIM; i++){
         for(int j=0; j < DIM; j++){
           shr->a[id][i][j]=shr->h[id][i][j];
         }
         shr->a[id][i][DIM] = shr->p[id][i];
       }
-      solve(&(shr->a[id][0][0]), shr->x[id]);
-      shr->cache[id] = dot(&(shr->p[id][0]), shr->x[id], DIM) / 2.;
+      solve(shr->a[id][0], shr->x[id]);
+      shr->cache[id] = dot(shr->p[id], shr->x[id], DIM) / 2.;
     }
     __syncthreads();
     
@@ -122,8 +123,8 @@ __global__ void sample(float *QS, float *qinit, SHARE *shr, long seed)
       shr->KtotalNew = ktn;
     }
     //6.
-    shr->cache[id] = U(&(shr->q[id][0]));
-     __syncthreads();
+    shr->cache[id] = U(shr->q[id]);
+    __syncthreads();
     if (id == 0){
       float Utotal = 0;
       for(int i=0;i<blockDim.x;i++){
@@ -150,9 +151,9 @@ __global__ void sample(float *QS, float *qinit, SHARE *shr, long seed)
     bool bad = false;
     //10.
 
-    memcpy(shr->q0[id], &(shr->q[id][0]), DIM*sizeof(float));
+    memcpy(shr->q0[id], shr->q[id], DIM*sizeof(float));
 
-    shr->UE[id][0] = U(&(shr->q[id][0]));
+    shr->UE[id][0] = U(shr->q[id]);
     //11.
     for(int k = 0; k < STEPS; k++){
       float dudq[DIM];
@@ -160,6 +161,8 @@ __global__ void sample(float *QS, float *qinit, SHARE *shr, long seed)
       for(int h = 0; h < DIM; h++){
         shr->p[id][h] -= shr->dt * dudq[h];
       }
+      //float q1[DIM];
+      memcpy(shr->q1[id],shr->q[id],sizeof(float)*DIM);
       //12.
       if(shr->vanilla){
         for(int h = 0; h < DIM; h++){
@@ -167,56 +170,61 @@ __global__ void sample(float *QS, float *qinit, SHARE *shr, long seed)
         }
       }else{
 
-        ddU(shr->q[id], &shr->h[id][0][0]);
+        ddU(shr->q[id], shr->h[id][0]);
         for(int i = 0; i < DIM; i++){
           for(int j=0; j < DIM; j++){
             shr->a[id][i][j]=shr->h[id][i][j];
           }
           shr->a[id][i][DIM] = shr->p[id][i];
         }
-        solve(&(shr->a[id][0][0]), shr->x[id]);
+        solve(shr->a[id][0], shr->x[id]);
         for(int h=0;h<DIM;h++){
           shr->q[id][h] += shr->dt *shr->x[id][h];
         }
       }
+      if(outbnd(shr->q[id])){
+        //printf("bad");
+        bad = true;
+        memcpy(shr->q[id],shr->q1[id],sizeof(float)*DIM);
+      }
+      //printf("%f %f\t",shr->q[id][0],shr->q[id][0]);
       //13.
       if(j<BURNIN){
         shr->UE[id][k+1]=U(shr->q[id]);
       }
     }
-    if(outbnd(shr->q[id])){
-      bad = true;
-    }
-    //14. compute Si and si
-    int mini = 0;
-    int maxi = 0;
-    for(int k=1; k<= STEPS; k++){
-      if(shr->UE[id][k]>shr->UE[id][maxi])
-        maxi = k;
-      else if(shr->UE[id][k]<shr->UE[id][mini])
-        mini = k;
-    }
-    shr->s[id] = mini;
-    shr->S[id] = maxi;
 
+    //14. compute Si and si
+    if(j<BURNIN){
+      int mini = 0;
+      int maxi = 0;
+      for(int k=1; k<= STEPS; k++){
+        if(shr->UE[id][k]>shr->UE[id][maxi])
+          maxi = k;
+        else if(shr->UE[id][k]<shr->UE[id][mini])
+          mini = k;
+      }
+      shr->s[id] = mini;
+      shr->S[id] = maxi;
+    }
     float alpha = 0.0;
     if(!bad){
       alpha = exp(clip(U(shr->q0[id])-U(shr->q[id]),-200.0,0.0));
+      //printf("%f\n", alpha);
     }
     shr->cache[id]=alpha;
     //15.
-    if(alpha < curand_uniform(&shr->state[id])){
+    if(alpha < curand_uniform(shr->state + id)){
       memcpy(shr->q[id], shr->q0[id], DIM*sizeof(float));
     }
     if(j>=BURNIN){
-      
-      //QS[j-BURNIN][id][DIM]
       memcpy(QS+(j-BURNIN)*gridDim.x*blockDim.x*DIM + id*DIM, shr->q[id], DIM*sizeof(float));
+      //printf("%f\n",shr->q[id][0]);
     }
     //16.
     __syncthreads();
     //tune
-    if (id == 0){
+    if (id == 0 && j < BURNIN){
       int s0=0,s1=0,S0=0,S1=0;
       float ap = 0;
       for(int k = 0; k< blockDim.x; k++){
@@ -291,14 +299,11 @@ int main()
 
   sample<<<BLOCKS,THREADS>>>(dev_QS, dev_qinit, dev_share, rand());
 
-
   HANDLE_ERROR(cudaMemcpy(QS, dev_QS, M*DIM*sizeof(float), cudaMemcpyDeviceToHost));
   cudaDeviceSynchronize();
  // usefull?
- cudaDeviceReset();
- cudaFree(dev_QS);
- cudaFree(dev_share);
- cudaFree(dev_qinit);
+  cudaDeviceReset();
+
  end = clock();
  cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
  printf("%f seconds",cpu_time_used);
@@ -314,7 +319,9 @@ int main()
 
   free(QS);
  // useful?
-  
+ cudaFree(dev_QS);
+ cudaFree(dev_share);
+ cudaFree(dev_qinit);  
 return 0;
 
 }
